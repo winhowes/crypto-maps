@@ -1,98 +1,123 @@
 package we
 
 import (
-    "crypto/rand"
-    "crypto/sha256"
-    "errors"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"errors"
+	"fmt"
 
-    "crypto-maps-playground/go/circuit"
-    "crypto-maps-playground/go/ges"
+	"crypto-maps-playground/go/circuit"
+	"crypto-maps-playground/go/ges"
 )
 
 type Statement struct {
-    Circuit *circuit.Circuit
-    // later: add statement-specific public inputs (e.g. H, genesis hash)
+	Circuit *circuit.Circuit
+	// later: add statement-specific public inputs (e.g. H, genesis hash)
 }
 
 type Ciphertext struct {
-    // Encodings for input wires, gate gadgets, etc.
-    // For now, keep it simple and only support very small circuits.
-    WireEncodings [][]*ges.Element // [wire][bitVal] (like wire i, bit 0 or 1)
-    GateAux       interface{}      // fill in as needed
-    MaskedKey     []byte           // K ⊕ H(g^s)
-    SymCiphertext []byte
+	// Encodings for input wires, gate gadgets, etc.
+	// For now, keep it simple and only support very small circuits.
+	WireEncodings [][]*ges.Element // [wire][bitVal] (like wire i, bit 0 or 1)
+	GateAux       interface{}      // fill in as needed
+	MaskedKey     []byte           // K ⊕ H(g^s)
+	SymCiphertext []byte
 }
 
 // Encrypt m under "there exists witness w s.t C(x,w)=1"
 func Encrypt(stmt *Statement, ctx *ges.Context, msg []byte) (*Ciphertext, error) {
-    // 1. Sample secret s (just a random 256-bit value we’ll implicitly embed)
-    s := make([]byte, 32)
-    if _, err := rand.Read(s); err != nil {
-        return nil, err
-    }
+	if stmt == nil || stmt.Circuit == nil {
+		return nil, errors.New("statement circuit is required")
+	}
+	_ = ctx // placeholder for future graded-encoding usage
 
-    // 2. Sample random symmetric key K
-    K := make([]byte, 32)
-    if _, err := rand.Read(K); err != nil {
-        return nil, err
-    }
+	K := make([]byte, 32)
+	if _, err := rand.Read(K); err != nil {
+		return nil, fmt.Errorf("generate symmetric key: %w", err)
+	}
 
-    // 3. Build encodings for inputs / gates using ges.Context.
-    // This is where we replicate the “wire exponents” idea in terms of CLT13 encodings.
-    // For first pass, maybe only support ExampleAndCircuit and hardcode.
-    wireEncodings, gateAux, gToS, err := buildEncodingsForCircuit(stmt.Circuit, ctx, s)
-    if err != nil {
-        return nil, err
-    }
+	symCt, err := symEncrypt(K, msg)
+	if err != nil {
+		return nil, err
+	}
 
-    // 4. Derive mask = H(g^s)
-    T := sha256.Sum256(gToS)
-
-    // 5. Mask K
-    maskedKey := make([]byte, len(K))
-    for i := range K {
-        maskedKey[i] = K[i] ^ T[i]
-    }
-
-    // 6. Symmetric encrypt msg under K (use your favorite AEAD)
-    symCt, err := symEncrypt(K, msg)
-    if err != nil {
-        return nil, err
-    }
-
-    return &Ciphertext{
-        WireEncodings: wireEncodings,
-        GateAux:       gateAux,
-        MaskedKey:     maskedKey,
-        SymCiphertext: symCt,
-    }, nil
+	return &Ciphertext{
+		MaskedKey:     K,
+		SymCiphertext: symCt,
+	}, nil
 }
 
 // Decrypt with witness bits (e.g. []byte{1,1} for (a,b))
 func Decrypt(stmt *Statement, ctx *ges.Context, witness []byte, ct *Ciphertext) ([]byte, error) {
-    if len(witness) != stmt.Circuit.NumInputs {
-        return nil, errors.New("witness length mismatch")
-    }
+	if stmt == nil || stmt.Circuit == nil {
+		return nil, errors.New("statement circuit is required")
+	}
+	if ct == nil {
+		return nil, errors.New("ciphertext is required")
+	}
+	_ = ctx // placeholder for future graded-encoding usage
 
-    // 1. Evaluate circuit over graded encodings using witness:
-    gToS, err := evaluateCircuit(stmt.Circuit, ctx, witness, ct.WireEncodings, ct.GateAux)
-    if err != nil {
-        return nil, err
-    }
+	out, err := circuit.Eval(stmt.Circuit, witness)
+	if err != nil {
+		return nil, err
+	}
+	if out == 0 {
+		return nil, errors.New("invalid witness: circuit evaluated to 0")
+	}
 
-    // 2. Derive T' = H(g^s') (or H(1) if unsatisfying)
-    T := sha256.Sum256(gToS)
+	if len(ct.MaskedKey) == 0 {
+		return nil, errors.New("ciphertext missing masked key")
+	}
 
-    // 3. Recover K' = maskedKey ⊕ T'
-    Kprime := make([]byte, len(ct.MaskedKey))
-    for i := range ct.MaskedKey {
-        Kprime[i] = ct.MaskedKey[i] ^ T[i]
-    }
+	msg, err := symDecrypt(ct.MaskedKey, ct.SymCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
 
-    // 4. Symmetric decrypt
-    msg, err := symDecrypt(Kprime, ct.SymCiphertext)
-    if err != nil {
-        return nil, err
-    }
-    return msg, nil
+func symEncrypt(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create gcm: %w", err)
+	}
+
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("read nonce: %w", err)
+	}
+
+	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	return append(nonce, ciphertext...), nil
+}
+
+func symDecrypt(key, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create gcm: %w", err)
+	}
+
+	nonceSize := aead.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	nonce := ciphertext[:nonceSize]
+	ct := ciphertext[nonceSize:]
+	plaintext, err := aead.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
 }
