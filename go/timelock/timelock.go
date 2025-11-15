@@ -60,4 +60,29 @@ func EncryptToyTimeLock(ctx *ges.Context, params TLEParams, msg []byte) (*we.Sta
 // decryption fails.
 func DecryptToyTimeLock(ctx *ges.Context, params TLEParams, chain *ToyChain, stmt *we.Statement, ct *we.Ciphertext) ([]byte, error) {
 	// 1. Verify chain in "native" Go.
-	if err := VerifyToyChain(chain,
+	if err := VerifyToyChain(chain, params.GenesisHash, params.DifficultyBits, params.TargetHeight); err != nil {
+		return nil, fmt.Errorf("VerifyToyChain: %w", err)
+	}
+
+	// 2. Feed witness bit = 1 into the trivial circuit.
+	witness := []byte{1}
+	msg, err := we.Decrypt(stmt, ctx, witness, ct)
+	if err != nil {
+		return nil, fmt.Errorf("we.Decrypt: %w", err)
+	}
+	return msg, nil
+}
+
+// GenesisFromString deterministically derives a genesis hash from the provided string.
+func GenesisFromString(s string) [ToyHashSize]byte {
+	return sha256.Sum256([]byte(s))
+}
+
+// RandomGenesis samples a uniformly random genesis hash.
+func RandomGenesis() ([ToyHashSize]byte, error) {
+	var out [ToyHashSize]byte
+	if _, err := rand.Read(out[:]); err != nil {
+		return out, fmt.Errorf("rand.Read genesis: %w", err)
+	}
+	return out, nil
+}
