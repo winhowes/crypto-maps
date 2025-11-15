@@ -1,3 +1,3 @@
 module crypto-maps-playground
 
-go 1.21
+go 1.25
